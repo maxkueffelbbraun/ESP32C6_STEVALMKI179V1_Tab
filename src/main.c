@@ -10,6 +10,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_rom_sys.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -72,6 +73,7 @@ typedef struct {
 	uint8_t wake_up_source;
 	uint8_t status_dup;
 	bool int2_level;
+	uint8_t ctrl1_reg;
 	uint32_t single_taps;
 	uint32_t double_taps;
 	uint32_t freefalls;
@@ -90,6 +92,8 @@ static volatile uint32_t isr_edge_count = 0;
 static volatile uint32_t int2_edge_count = 0;
 static bool tap_event_active = false;
 static bool freefall_event_active = false;
+static uint32_t cpu_freq_mhz = 0;
+static wifi_ps_type_t wifi_ps_mode = WIFI_PS_NONE;
 
 static const char index_html[] =
 	"<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">"
@@ -110,7 +114,12 @@ static const char index_html[] =
 	"<div><div class=\"label\">Single Taps</div><div class=\"value\" id=\"single\">-</div></div>"
 	"<div><div class=\"label\">Double Taps</div><div class=\"value\" id=\"double\">-</div></div>"
 	"<div><div class=\"label\">Freefall</div><div class=\"value\" id=\"freefalls\">-</div></div>"
-	"</div><p>Interrupts: <span id=\"interrupts\">-</span> | TAP_SRC: <span id=\"tap_source\">-</span> | WAKE_UP_SRC: <span id=\"wake_up_source\">-</span></p><p>INT2 (GPIO14): <span id=\"int2\">-</span> | INT2-Flanken: <span id=\"int2_edges\">-</span></p></section></main>"
+	"</div><p>Interrupts: <span id=\"interrupts\">-</span> | TAP_SRC: <span id=\"tap_source\">-</span> | WAKE_UP_SRC: <span id=\"wake_up_source\">-</span></p><p>INT2 (GPIO14): <span id=\"int2\">-</span> | INT2-Flanken: <span id=\"int2_edges\">-</span></p></section>"
+	"<section><div class=\"label\">Energiemodus (keine echte Strommessung)</div>"
+	"<p>LIS2DW12: <span id=\"lis_mode\">-</span></p>"
+	"<p>Richtwert lt. Datenblatt: <span id=\"lis_power_note\">-</span></p>"
+	"<p>ESP32 CPU-Takt: <span id=\"cpu_freq\">-</span> MHz | Wi-Fi Power-Save: <span id=\"wifi_ps\">-</span></p>"
+	"</section></main>"
 	"<script>async function update(){let controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2000);try{let response=await fetch('/api/state?ts='+Date.now(),{cache:'no-store',signal:controller.signal});let d=await response.json();"
 	"let i=document.querySelector('#i2c');i.textContent=d.i2c_connected?'Verbunden mit Adresse 0x'+d.i2c_address.toString(16).padStart(2,'0'):'Keine Antwort an 0x19 oder 0x18 (I2C-Fehler '+d.i2c_error+')';i.className=d.i2c_connected?'ok':'error';"
 	"document.querySelector('#sda').textContent=d.sda_level?'HIGH (3.3 V)':'LOW (0 V)';document.querySelector('#scl').textContent=d.scl_level?'HIGH (3.3 V)':'LOW (0 V)';"
@@ -119,6 +128,9 @@ static const char index_html[] =
 	"for(let k of ['fifo','single','double','freefalls','interrupts'])document.querySelector('#'+k).textContent=d[k+(k==='fifo'?'_samples':k==='single'?'_taps':k==='double'?'_taps':k==='freefalls'?'':'')];"
 	"document.querySelector('#tap_source').textContent='0x'+d.tap_source.toString(16).padStart(2,'0');document.querySelector('#wake_up_source').textContent='0x'+d.wake_up_source.toString(16).padStart(2,'0');"
 	"document.querySelector('#int2').textContent=d.int2_level?'HIGH (3.3 V)':'LOW (0 V)';document.querySelector('#int2_edges').textContent=d.int2_edges;"
+	"document.querySelector('#lis_mode').textContent=d.lis2dw12_mode+' @ '+d.lis2dw12_odr_hz+' Hz'+(d.lis2dw12_lp_submode?' ('+d.lis2dw12_lp_submode+')':'');"
+	"document.querySelector('#lis_power_note').textContent=d.lis2dw12_power_note;"
+	"document.querySelector('#cpu_freq').textContent=d.cpu_freq_mhz;document.querySelector('#wifi_ps').textContent=d.wifi_ps_mode;"
 	"}catch(e){document.querySelector('#status').textContent='API nicht erreichbar';document.querySelector('#i2c').textContent='I2C-Status nicht abrufbar';document.querySelector('#i2c').className='error'}finally{clearTimeout(timer);setTimeout(update,500)}}update()</script>"
 	"</body></html>";
 
@@ -249,7 +261,53 @@ static bool lis2dw12_configure(void)
 		readback[1], readback[2], readback[3], readback[9], readback[8], free_fall_reg);
 
 	ESP_LOGI(TAG, "LIS2DW12 detected and configured: 400 Hz, +/-2 g, FIFO, tap and freefall enabled");
+	portENTER_CRITICAL(&state_lock);
+	sensor_state.ctrl1_reg = readback[0];
+	portEXIT_CRITICAL(&state_lock);
 	return true;
+}
+
+// Decodes CTRL1 (ODR[7:4], MODE[3:2], LP_MODE[1:0]) into a human-readable power mode.
+static float lis2dw12_odr_hz(uint8_t ctrl1)
+{
+	static const float odr_table[] = {0.0f, 1.6f, 12.5f, 25.0f, 50.0f, 100.0f, 200.0f, 400.0f, 800.0f, 1600.0f};
+	uint8_t odr = (ctrl1 >> 4) & 0x0F;
+	return odr < (sizeof(odr_table) / sizeof(odr_table[0])) ? odr_table[odr] : 0.0f;
+}
+
+static const char *lis2dw12_mode_name(uint8_t ctrl1)
+{
+	switch ((ctrl1 >> 2) & 0x03) {
+	case 0: return "Low-Power";
+	case 1: return "High-Performance";
+	default: return "Reserved";
+	}
+}
+
+static const char *lis2dw12_lp_submode_name(uint8_t ctrl1)
+{
+	if (((ctrl1 >> 2) & 0x03) != 0) {
+		return "";
+	}
+	switch (ctrl1 & 0x03) {
+	case 0: return "LP Mode 1, 12-bit";
+	case 1: return "LP Mode 2, 14-bit";
+	case 2: return "LP Mode 3, 14-bit";
+	default: return "LP Mode 4, 14-bit";
+	}
+}
+
+// Only the ultra-low-power headline figures from ST's datasheet are quoted here;
+// High-Performance draw depends heavily on ODR and needs a real current-sensor measurement.
+static const char *lis2dw12_power_note(uint8_t ctrl1)
+{
+	if (((ctrl1 >> 4) & 0x0F) == 0) {
+		return "~50 nA typ. (power-down, ST datasheet)";
+	}
+	if (((ctrl1 >> 2) & 0x03) == 0) {
+		return "< 1 uA typ. (low-power mode, ST datasheet headline figure)";
+	}
+	return "not specified here; measure externally for an exact value";
 }
 
 static void read_sensor_sample(void)
@@ -396,20 +454,25 @@ static esp_err_t index_handler(httpd_req_t *request)
 static esp_err_t state_handler(httpd_req_t *request)
 {
 	sensor_state_t state;
-	char response[320];
+	char response[640];
 	portENTER_CRITICAL(&state_lock);
 	state = sensor_state;
 	portEXIT_CRITICAL(&state_lock);
 	httpd_resp_set_hdr(request, "Cache-Control", "no-store, no-cache, must-revalidate");
+	const char *wifi_ps_name = wifi_ps_mode == WIFI_PS_NONE ? "None (radio always on)"
+		: wifi_ps_mode == WIFI_PS_MIN_MODEM ? "Minimum modem sleep" : "Maximum modem sleep";
 	int length = snprintf(response, sizeof(response),
 		"{\"sensor_found\":%s,\"i2c_connected\":%s,\"sda_level\":%s,\"scl_level\":%s,\"i2c_address\":%u,\"i2c_error\":%d,\"who_am_i\":%u,\"x_g\":%.4f,\"y_g\":%.4f,\"z_g\":%.4f,"
-		"\"fifo_samples\":%u,\"single_taps\":%lu,\"double_taps\":%lu,\"freefalls\":%lu,\"interrupts\":%lu,\"tap_source\":%u,\"wake_up_source\":%u,\"int2_level\":%s,\"int2_edges\":%lu}",
+		"\"fifo_samples\":%u,\"single_taps\":%lu,\"double_taps\":%lu,\"freefalls\":%lu,\"interrupts\":%lu,\"tap_source\":%u,\"wake_up_source\":%u,\"int2_level\":%s,\"int2_edges\":%lu,"
+		"\"lis2dw12_mode\":\"%s\",\"lis2dw12_odr_hz\":%.1f,\"lis2dw12_lp_submode\":\"%s\",\"lis2dw12_power_note\":\"%s\",\"cpu_freq_mhz\":%lu,\"wifi_ps_mode\":\"%s\"}",
 		state.sensor_found ? "true" : "false", state.i2c_connected ? "true" : "false",
 		state.sda_level ? "true" : "false", state.scl_level ? "true" : "false",
 		state.i2c_address, state.i2c_error, state.who_am_i, state.x_g, state.y_g, state.z_g,
 		state.fifo_samples, (unsigned long)state.single_taps, (unsigned long)state.double_taps,
 		(unsigned long)state.freefalls, (unsigned long)state.interrupts, state.tap_source, state.wake_up_source,
-		state.int2_level ? "true" : "false", (unsigned long)int2_edge_count);
+		state.int2_level ? "true" : "false", (unsigned long)int2_edge_count,
+		lis2dw12_mode_name(state.ctrl1_reg), lis2dw12_odr_hz(state.ctrl1_reg), lis2dw12_lp_submode_name(state.ctrl1_reg),
+		lis2dw12_power_note(state.ctrl1_reg), (unsigned long)cpu_freq_mhz, wifi_ps_name);
 	httpd_resp_set_type(request, "application/json");
 	if (length <= 0 || length >= sizeof(response)) {
 		return httpd_resp_send(request, "{}", 2);
@@ -451,6 +514,8 @@ static void start_access_point(void)
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
 	ESP_ERROR_CHECK(esp_wifi_start());
+	esp_wifi_get_ps(&wifi_ps_mode);
+	cpu_freq_mhz = esp_rom_get_cpu_ticks_per_us();
 	ESP_LOGI(TAG, "Access point started: %s, open http://192.168.4.1", WIFI_AP_SSID);
 }
 

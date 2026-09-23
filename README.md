@@ -41,6 +41,8 @@ with a small web dashboard.
    including XYZ acceleration, `TAP_SRC`, `WAKE_UP_SRC`, `STATUS_DUP`, tap and
    freefall counters, the `INT1` edge count, and the `INT2` (`GPIO14`) level
    and edge count.
+6. Reports the sensor's configured power mode and the ESP32's CPU frequency /
+   Wi-Fi power-save mode on the dashboard (see [Power information](#power-information)).
 
 ## Freefall detection
 
@@ -89,6 +91,27 @@ fault independently of `INT1`.
 | 5 | `INT2_BOOT` | Boot running |
 | 6 | `INT2_SLEEP_CHG` | Sleep state changed |
 | 7 | `INT2_SLEEP_STATE` | Current sleep state |
+
+## Power information
+
+There is no current/voltage sensor (e.g. INA219/INA226) on this board, so the
+dashboard cannot show real measured mA/mW. Instead it reports the actual
+configured power-relevant settings, read back from the hardware:
+
+- **LIS2DW12 mode**: decoded from `CTRL1` (ODR in Hz, `High-Performance` vs.
+  `Low-Power` mode 1-4). Currently configured for 400 Hz / High-Performance.
+- **LIS2DW12 typical current**: only quoted for the cases verified on ST's own
+  product page (`~50 nA` power-down, `< 1 uA` in low-power mode). For
+  High-Performance mode this is intentionally left as "not specified here",
+  since actual draw depends heavily on ODR and needs a real current-sensor
+  measurement, not a guessed number.
+- **ESP32 CPU frequency**: read via `esp_rom_get_cpu_ticks_per_us()`.
+- **ESP32 Wi-Fi power-save mode**: read via `esp_wifi_get_ps()` after
+  `esp_wifi_start()`. Note that in access-point-only mode this setting has
+  limited effect, since the radio must stay active to serve beacons/clients.
+
+For real power-consumption numbers, measure the supply current externally
+(e.g. with an INA219/INA226 or a bench power analyzer).
 
 ## Tap detection notes
 
