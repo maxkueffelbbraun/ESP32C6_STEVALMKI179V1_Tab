@@ -18,13 +18,16 @@
 #define I2C_SDA_GPIO GPIO_NUM_0
 #define I2C_SCL_GPIO GPIO_NUM_1
 #define LIS2DW12_INT1_GPIO GPIO_NUM_15
+#define LIS2DW12_INT2_GPIO GPIO_NUM_14
 #define STATUS_LED_GPIO GPIO_NUM_8
 #define LIS2DW12_WHO_AM_I_VALUE 0x44
 #define LIS2DW12_I2C_TIMEOUT_MS 100
 
 #define LIS2DW12_REG_WHO_AM_I 0x0F
 #define LIS2DW12_REG_CTRL1 0x20
+#define LIS2DW12_REG_CTRL3 0x22
 #define LIS2DW12_REG_CTRL4_INT1_PAD_CTRL 0x23
+#define LIS2DW12_REG_CTRL5_INT2_PAD_CTRL 0x24
 #define LIS2DW12_REG_CTRL6 0x25
 #define LIS2DW12_REG_OUT_X_L 0x28
 #define LIS2DW12_REG_FIFO_CTRL 0x2E
@@ -34,6 +37,8 @@
 #define LIS2DW12_REG_TAP_THS_Z 0x32
 #define LIS2DW12_REG_INT_DUR 0x33
 #define LIS2DW12_REG_WAKE_UP_THS 0x34
+#define LIS2DW12_REG_WAKE_UP_DUR 0x35
+#define LIS2DW12_REG_FREE_FALL 0x36
 #define LIS2DW12_REG_STATUS_DUP 0x37
 #define LIS2DW12_REG_WAKE_UP_SRC 0x38
 #define LIS2DW12_REG_TAP_SRC 0x39
@@ -42,6 +47,7 @@
 #define LIS2DW12_TAP_SRC_TAP_IA (1U << 6)
 #define LIS2DW12_TAP_SRC_SINGLE_TAP (1U << 5)
 #define LIS2DW12_TAP_SRC_DOUBLE_TAP (1U << 4)
+#define LIS2DW12_WAKE_UP_SRC_FF_IA (1U << 5)
 
 #define WIFI_AP_SSID "LIS2DW12-Test"
 #define WIFI_AP_PASSWORD "lis2dw12test"
@@ -65,8 +71,10 @@ typedef struct {
 	uint8_t tap_source;
 	uint8_t wake_up_source;
 	uint8_t status_dup;
+	bool int2_level;
 	uint32_t single_taps;
 	uint32_t double_taps;
+	uint32_t freefalls;
 	uint32_t interrupts;
 } sensor_state_t;
 
@@ -79,6 +87,9 @@ static TaskHandle_t sensor_task_handle;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static sensor_state_t sensor_state;
 static volatile uint32_t isr_edge_count = 0;
+static volatile uint32_t int2_edge_count = 0;
+static bool tap_event_active = false;
+static bool freefall_event_active = false;
 
 static const char index_html[] =
 	"<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">"
@@ -98,14 +109,16 @@ static const char index_html[] =
 	"<div><div class=\"label\">FIFO-Samples</div><div class=\"value\" id=\"fifo\">-</div></div>"
 	"<div><div class=\"label\">Single Taps</div><div class=\"value\" id=\"single\">-</div></div>"
 	"<div><div class=\"label\">Double Taps</div><div class=\"value\" id=\"double\">-</div></div>"
-	"</div><p>Interrupts: <span id=\"interrupts\">-</span> | TAP_SRC: <span id=\"tap_source\">-</span></p></section></main>"
+	"<div><div class=\"label\">Freefall</div><div class=\"value\" id=\"freefalls\">-</div></div>"
+	"</div><p>Interrupts: <span id=\"interrupts\">-</span> | TAP_SRC: <span id=\"tap_source\">-</span> | WAKE_UP_SRC: <span id=\"wake_up_source\">-</span></p><p>INT2 (GPIO14): <span id=\"int2\">-</span> | INT2-Flanken: <span id=\"int2_edges\">-</span></p></section></main>"
 	"<script>async function update(){let controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2000);try{let response=await fetch('/api/state?ts='+Date.now(),{cache:'no-store',signal:controller.signal});let d=await response.json();"
 	"let i=document.querySelector('#i2c');i.textContent=d.i2c_connected?'Verbunden mit Adresse 0x'+d.i2c_address.toString(16).padStart(2,'0'):'Keine Antwort an 0x19 oder 0x18 (I2C-Fehler '+d.i2c_error+')';i.className=d.i2c_connected?'ok':'error';"
 	"document.querySelector('#sda').textContent=d.sda_level?'HIGH (3.3 V)':'LOW (0 V)';document.querySelector('#scl').textContent=d.scl_level?'HIGH (3.3 V)':'LOW (0 V)';"
 	"document.querySelector('#status').textContent=d.sensor_found?'Sensor OK, WHO_AM_I: 0x'+d.who_am_i.toString(16).padStart(2,'0'):'Sensor nicht gefunden';"
 	"for(let k of ['x','y','z'])document.querySelector('#'+k).textContent=d[k+'_g'].toFixed(3)+' g';"
-	"for(let k of ['fifo','single','double','interrupts'])document.querySelector('#'+k).textContent=d[k+(k==='fifo'?'_samples':k==='single'?'_taps':k==='double'?'_taps':'')];"
-	"document.querySelector('#tap_source').textContent='0x'+d.tap_source.toString(16).padStart(2,'0');"
+	"for(let k of ['fifo','single','double','freefalls','interrupts'])document.querySelector('#'+k).textContent=d[k+(k==='fifo'?'_samples':k==='single'?'_taps':k==='double'?'_taps':k==='freefalls'?'':'')];"
+	"document.querySelector('#tap_source').textContent='0x'+d.tap_source.toString(16).padStart(2,'0');document.querySelector('#wake_up_source').textContent='0x'+d.wake_up_source.toString(16).padStart(2,'0');"
+	"document.querySelector('#int2').textContent=d.int2_level?'HIGH (3.3 V)':'LOW (0 V)';document.querySelector('#int2_edges').textContent=d.int2_edges;"
 	"}catch(e){document.querySelector('#status').textContent='API nicht erreichbar';document.querySelector('#i2c').textContent='I2C-Status nicht abrufbar';document.querySelector('#i2c').className='error'}finally{clearTimeout(timer);setTimeout(update,500)}}update()</script>"
 	"</body></html>";
 
@@ -196,14 +209,18 @@ static bool lis2dw12_configure(void)
 	// This mounting needs a much more sensitive tap threshold than ST's reference (verified working)
 	const struct { uint8_t reg; uint8_t value; } config[] = {
 		{LIS2DW12_REG_CTRL1, 0x74},             // 400 Hz, high-performance mode (required for correct tap timing)
+		{LIS2DW12_REG_CTRL3, 0x00},             // Active-high, push-pull interrupt outputs
 		{LIS2DW12_REG_CTRL6, 0x00},             // +/-2 g full scale
 		{LIS2DW12_REG_FIFO_CTRL, 0xCA},         // Continuous FIFO mode, threshold 10 samples
 		{LIS2DW12_REG_TAP_THS_X, 0x02},          // Tap threshold X = 2
 		{LIS2DW12_REG_TAP_THS_Y, 0x02},          // Tap threshold Y = 2
 		{LIS2DW12_REG_TAP_THS_Z, 0xE2},          // Enable X/Y/Z tap axes, tap threshold Z = 2
 		{LIS2DW12_REG_INT_DUR, 0x7F},            // Tap shock, quiet and latency windows
-		{LIS2DW12_REG_WAKE_UP_THS, 0x80},        // Single/double-tap mode, minimum threshold
-		{LIS2DW12_REG_CTRL4_INT1_PAD_CTRL, 0x48}, // Route single-tap (bit6) and double-tap (bit3) to INT1
+		{LIS2DW12_REG_WAKE_UP_THS, 0x80},        // Enable single/double-tap threshold format (bit7); wake-up feature unused (WK_THS=0)
+		{LIS2DW12_REG_WAKE_UP_DUR, 0x00},        // FF_DUR bit5 = 0; sleep/wake-up duration unused
+		{LIS2DW12_REG_FREE_FALL, 0x33},          // Actual freefall config: FF_THS=3 (~312 mg), FF_DUR=6 samples
+		{LIS2DW12_REG_CTRL4_INT1_PAD_CTRL, 0x58}, // Route freefall (bit4), single-tap (bit6) and double-tap (bit3) to INT1
+		{LIS2DW12_REG_CTRL5_INT2_PAD_CTRL, 0x00}, // INT2 unused: this sensor has no freefall bit on INT2 (bit4 there is temperature-DRDY)
 		{LIS2DW12_REG_CTRL7, 0x20},              // Explicitly enable interrupt/event generation
 	};
 
@@ -215,20 +232,23 @@ static bool lis2dw12_configure(void)
 		}
 	}
 
-	uint8_t readback[9] = {0};
+	uint8_t readback[10] = {0};
 	lis2dw12_read(LIS2DW12_REG_CTRL1, &readback[0], 1);
-	lis2dw12_read(LIS2DW12_REG_CTRL4_INT1_PAD_CTRL, &readback[1], 1);
-	lis2dw12_read(LIS2DW12_REG_TAP_THS_X, &readback[2], 1);
-	lis2dw12_read(LIS2DW12_REG_TAP_THS_Y, &readback[3], 1);
-	lis2dw12_read(LIS2DW12_REG_TAP_THS_Z, &readback[4], 1);
-	lis2dw12_read(LIS2DW12_REG_INT_DUR, &readback[5], 1);
-	lis2dw12_read(LIS2DW12_REG_WAKE_UP_THS, &readback[6], 1);
-	lis2dw12_read(LIS2DW12_REG_CTRL6, &readback[7], 1);
-	lis2dw12_read(LIS2DW12_REG_CTRL7, &readback[8], 1);
-	ESP_LOGI(TAG, "Tap regs readback: CTRL1=0x%02X CTRL4=0x%02X THS_X=0x%02X THS_Y=0x%02X THS_Z=0x%02X INT_DUR=0x%02X WAKE_UP_THS=0x%02X CTRL6=0x%02X CTRL7=0x%02X",
-		readback[0], readback[1], readback[2], readback[3], readback[4], readback[5], readback[6], readback[7], readback[8]);
+	lis2dw12_read(LIS2DW12_REG_CTRL3, &readback[1], 1);
+	lis2dw12_read(LIS2DW12_REG_CTRL4_INT1_PAD_CTRL, &readback[2], 1);
+	lis2dw12_read(LIS2DW12_REG_CTRL5_INT2_PAD_CTRL, &readback[3], 1);
+	lis2dw12_read(LIS2DW12_REG_TAP_THS_X, &readback[4], 1);
+	lis2dw12_read(LIS2DW12_REG_TAP_THS_Y, &readback[5], 1);
+	lis2dw12_read(LIS2DW12_REG_TAP_THS_Z, &readback[6], 1);
+	lis2dw12_read(LIS2DW12_REG_INT_DUR, &readback[7], 1);
+	lis2dw12_read(LIS2DW12_REG_WAKE_UP_THS, &readback[8], 1);
+	lis2dw12_read(LIS2DW12_REG_CTRL7, &readback[9], 1);
+	uint8_t free_fall_reg = 0;
+	lis2dw12_read(LIS2DW12_REG_FREE_FALL, &free_fall_reg, 1);
+	ESP_LOGI(TAG, "Interrupt regs: CTRL3=0x%02X CTRL4=0x%02X CTRL5=0x%02X CTRL7=0x%02X WAKE_UP_THS=0x%02X FREE_FALL=0x%02X",
+		readback[1], readback[2], readback[3], readback[9], readback[8], free_fall_reg);
 
-	ESP_LOGI(TAG, "LIS2DW12 detected and configured: 400 Hz, +/-2 g, FIFO and double-tap enabled (diagnostic thresholds)");
+	ESP_LOGI(TAG, "LIS2DW12 detected and configured: 400 Hz, +/-2 g, FIFO, tap and freefall enabled");
 	return true;
 }
 
@@ -265,12 +285,22 @@ static void process_interrupt(void)
 	}
 	lis2dw12_read(LIS2DW12_REG_WAKE_UP_SRC, &wake_up_source, 1);
 	lis2dw12_read(LIS2DW12_REG_STATUS_DUP, &status_dup, 1);
+	bool freefall_active = (wake_up_source & LIS2DW12_WAKE_UP_SRC_FF_IA) != 0;
+	bool tap_active = (tap_source & (LIS2DW12_TAP_SRC_TAP_IA | LIS2DW12_TAP_SRC_SINGLE_TAP | LIS2DW12_TAP_SRC_DOUBLE_TAP)) != 0;
+	bool new_freefall = freefall_active && !freefall_event_active;
+	bool new_tap = tap_active && !tap_event_active;
+	freefall_event_active = freefall_active;
+	tap_event_active = tap_active;
 
 	portENTER_CRITICAL(&state_lock);
 	sensor_state.tap_source = tap_source;
 	sensor_state.wake_up_source = wake_up_source;
 	sensor_state.status_dup = status_dup;
-	if ((tap_source & (LIS2DW12_TAP_SRC_TAP_IA | LIS2DW12_TAP_SRC_SINGLE_TAP | LIS2DW12_TAP_SRC_DOUBLE_TAP)) != 0) {
+	if (new_freefall) {
+		sensor_state.freefalls++;
+		sensor_state.interrupts++;
+	}
+	if (new_tap) {
 		sensor_state.interrupts++;
 		if ((tap_source & LIS2DW12_TAP_SRC_DOUBLE_TAP) != 0) {
 			sensor_state.double_taps++;
@@ -279,7 +309,11 @@ static void process_interrupt(void)
 		}
 	}
 	portEXIT_CRITICAL(&state_lock);
-	if ((tap_source & (LIS2DW12_TAP_SRC_TAP_IA | LIS2DW12_TAP_SRC_SINGLE_TAP | LIS2DW12_TAP_SRC_DOUBLE_TAP)) != 0) {
+	if (new_freefall) {
+		set_status_led(80, 30, 0);
+		ESP_LOGI(TAG, "Freefall detected: WAKE_UP_SRC=0x%02X", wake_up_source);
+	}
+	if (new_tap) {
 		set_status_led(20, 0, 80);
 		ESP_LOGI(TAG, "Tap source: 0x%02X (single=%d double=%d tap_ia=%d)",
 			tap_source,
@@ -304,6 +338,7 @@ static void sensor_task(void *argument)
 			read_sensor_sample();
 			process_interrupt();
 			portENTER_CRITICAL(&state_lock);
+			sensor_state.int2_level = gpio_get_level(LIS2DW12_INT2_GPIO) != 0;
 			state = sensor_state;
 			portEXIT_CRITICAL(&state_lock);
 		} else if (xTaskGetTickCount() >= next_probe) {
@@ -323,13 +358,14 @@ static void sensor_task(void *argument)
 			next_report = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
 			ESP_LOGI(TAG,
 				"DATA i2c=%s addr=0x%02X error=%d sensor=%s WHO_AM_I=0x%02X "
-				"SDA=%s SCL=%s XYZ=(%.3f, %.3f, %.3f)g FIFO=%u TAP_SRC=0x%02X WAKE_UP_SRC=0x%02X STATUS_DUP=0x%02X taps=%lu/%lu irq=%lu INT1_EDGES=%lu",
+				"SDA=%s SCL=%s XYZ=(%.3f, %.3f, %.3f)g FIFO=%u TAP_SRC=0x%02X WAKE_UP_SRC=0x%02X STATUS_DUP=0x%02X taps=%lu/%lu freefalls=%lu irq=%lu INT1_EDGES=%lu INT2=%s INT2_EDGES=%lu",
 				state.i2c_connected ? "OK" : "FAIL", state.i2c_address, state.i2c_error,
 				state.sensor_found ? "OK" : "FAIL", state.who_am_i,
 				state.sda_level ? "HIGH" : "LOW", state.scl_level ? "HIGH" : "LOW",
 				state.x_g, state.y_g, state.z_g, state.fifo_samples, state.tap_source, state.wake_up_source, state.status_dup,
-				(unsigned long)state.single_taps, (unsigned long)state.double_taps,
-				(unsigned long)state.interrupts, (unsigned long)isr_edge_count);
+				(unsigned long)state.single_taps, (unsigned long)state.double_taps, (unsigned long)state.freefalls,
+				(unsigned long)state.interrupts, (unsigned long)isr_edge_count,
+				state.int2_level ? "HIGH" : "LOW", (unsigned long)int2_edge_count);
 		}
 	}
 }
@@ -342,6 +378,11 @@ static void IRAM_ATTR int1_isr_handler(void *argument)
 	if (higher_priority_task_woken == pdTRUE) {
 		portYIELD_FROM_ISR();
 	}
+}
+
+static void IRAM_ATTR int2_isr_handler(void *argument)
+{
+	int2_edge_count++;
 }
 
 static esp_err_t index_handler(httpd_req_t *request)
@@ -362,12 +403,13 @@ static esp_err_t state_handler(httpd_req_t *request)
 	httpd_resp_set_hdr(request, "Cache-Control", "no-store, no-cache, must-revalidate");
 	int length = snprintf(response, sizeof(response),
 		"{\"sensor_found\":%s,\"i2c_connected\":%s,\"sda_level\":%s,\"scl_level\":%s,\"i2c_address\":%u,\"i2c_error\":%d,\"who_am_i\":%u,\"x_g\":%.4f,\"y_g\":%.4f,\"z_g\":%.4f,"
-		"\"fifo_samples\":%u,\"single_taps\":%lu,\"double_taps\":%lu,\"interrupts\":%lu,\"tap_source\":%u}",
+		"\"fifo_samples\":%u,\"single_taps\":%lu,\"double_taps\":%lu,\"freefalls\":%lu,\"interrupts\":%lu,\"tap_source\":%u,\"wake_up_source\":%u,\"int2_level\":%s,\"int2_edges\":%lu}",
 		state.sensor_found ? "true" : "false", state.i2c_connected ? "true" : "false",
 		state.sda_level ? "true" : "false", state.scl_level ? "true" : "false",
 		state.i2c_address, state.i2c_error, state.who_am_i, state.x_g, state.y_g, state.z_g,
 		state.fifo_samples, (unsigned long)state.single_taps, (unsigned long)state.double_taps,
-		(unsigned long)state.interrupts, state.tap_source);
+		(unsigned long)state.freefalls, (unsigned long)state.interrupts, state.tap_source, state.wake_up_source,
+		state.int2_level ? "true" : "false", (unsigned long)int2_edge_count);
 	httpd_resp_set_type(request, "application/json");
 	if (length <= 0 || length >= sizeof(response)) {
 		return httpd_resp_send(request, "{}", 2);
@@ -455,6 +497,14 @@ void app_main(void)
 		.intr_type = GPIO_INTR_POSEDGE,
 	};
 	ESP_ERROR_CHECK(gpio_config(&int_config));
+	gpio_config_t int2_config = {
+		.pin_bit_mask = 1ULL << LIS2DW12_INT2_GPIO,
+		.mode = GPIO_MODE_INPUT,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_POSEDGE,
+	};
+	ESP_ERROR_CHECK(gpio_config(&int2_config));
 	ESP_ERROR_CHECK(gpio_install_isr_service(0));
 
 	if (lis2dw12_connect()) {
@@ -462,6 +512,7 @@ void app_main(void)
 	}
 	xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, &sensor_task_handle);
 	ESP_ERROR_CHECK(gpio_isr_handler_add(LIS2DW12_INT1_GPIO, int1_isr_handler, NULL));
+	ESP_ERROR_CHECK(gpio_isr_handler_add(LIS2DW12_INT2_GPIO, int2_isr_handler, NULL));
 	start_access_point();
 	start_web_server();
 }
