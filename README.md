@@ -17,6 +17,10 @@ with a small web dashboard.
   - Onboard status LED (WS2812/RMT): `GPIO8`
 - **I2C address**: auto-probed at `0x19` (SA0=1) or `0x18` (SA0=0)
 
+![ESP32-C6 wired to the STEVAL-MKI179V1 LIS2DW12 board](docs/images/setup-2.jpg)
+
+![Live dashboard showing single/double tap counters](docs/images/setup-1.jpg)
+
 ## What it does
 
 1. Probes the I2C bus for the LIS2DW12 and verifies `WHO_AM_I == 0x44`.
