@@ -1,6 +1,6 @@
-# ESP32-C6 + LIS2DW12 Tap Event Test
+# ESP32-C6 + LIS2DU12 Tap Event Test
 
-Firmware for an ESP32-C6 (DevKitM-1) that reads a LIS2DW12 3-axis accelerometer
+Firmware for an ESP32-C6 (DevKitM-1) that reads a LIS2DU12 3-axis accelerometer
 over I2C, detects single-/double-tap and freefall events using the sensor's
 built-in event engines, and exposes live sensor data through a Wi-Fi access point
 with a small web dashboard.
@@ -8,23 +8,21 @@ with a small web dashboard.
 ## Hardware
 
 - **MCU**: ESP32-C6-DevKitM-1
-- **Sensor**: STMicroelectronics LIS2DW12 (tested on STEVAL-MKI179V1, rigidly
+- **Sensor**: STMicroelectronics LIS2DU12 (tested on STEVAL-MKI222V1, rigidly
   soldered)
 - **Wiring**:
   - I2C SDA: `GPIO0`
   - I2C SCL: `GPIO1`
-  - LIS2DW12 `INT1`: `GPIO15` (tap + freefall events)
-  - LIS2DW12 `INT2`: `GPIO14` (diagnostic only, no event routed by default)
+  - LIS2DU12 `INT1`: `GPIO15` (tap + freefall events)
+  - LIS2DU12 `INT2`: `GPIO14` (diagnostic only, no event routed by default)
   - Onboard status LED (WS2812/RMT): `GPIO8`
 - **I2C address**: auto-probed at `0x19` (SA0=1) or `0x18` (SA0=0)
-
-![ESP32-C6 wired to the STEVAL-MKI179V1 LIS2DW12 board](docs/images/setup-2.jpg)
 
 ![Live dashboard showing single/double tap counters](docs/images/setup-1.jpg)
 
 ## What it does
 
-1. Probes the I2C bus for the LIS2DW12 and verifies `WHO_AM_I == 0x44`.
+1. Probes the I2C bus for the LIS2DU12 and verifies `WHO_AM_I == 0x45`.
 2. Configures the sensor for 400 Hz / High-Performance mode, ±2 g full scale,
    and enables the hardware single-/double-tap detection engine on all three
    axes (`TAP_THS_X/Y/Z`, `INT_DUR`, `WAKE_UP_THS`) and the freefall engine
@@ -34,7 +32,7 @@ with a small web dashboard.
    (independent of the `INT1` GPIO interrupt, which only wakes the task early)
    and counts a tap or freefall event only on its rising edge, so a single
    physical event is never counted or logged more than once.
-4. Starts a Wi-Fi access point (`LIS2DW12-Test` / `lis2dw12test`) and a small
+4. Starts a Wi-Fi access point (`LIS2DU12-Test` / `lis2du12test`) and a small
    HTTP server serving a live dashboard at `http://192.168.4.1` (polls
    `/api/state` twice a second).
 5. Logs a `DATA ...` summary line once per second over serial (115200 baud),
@@ -46,7 +44,7 @@ with a small web dashboard.
 
 ## Freefall detection
 
-The LIS2DW12 hardware event engine raises `WAKE_UP_SRC.FF_IA` (bit 5) when the
+The LIS2DU12 hardware event engine raises `WAKE_UP_SRC.FF_IA` (bit 5) when the
 measured acceleration modulus stays below the `FF_THS` threshold for `FF_DUR`
 samples. Both fields live in the dedicated `FREE_FALL` register (`0x36`),
 configured as `FF_THS = 3` (~312 mg) and `FF_DUR = 6` samples (~15 ms at
@@ -63,7 +61,7 @@ software to tell tap and freefall events apart on the shared pin.
 single-/double-tap threshold format (bit7 of `WAKE_UP_THS`); they do not affect
 freefall.
 
-For a different mechanical setup, adjust `LIS2DW12_REG_FREE_FALL` in
+For a different mechanical setup, adjust `LIS2DU12_REG_FREE_FALL` in
 `src/main.c` (`FF_THS` in bits 0-2, `FF_DUR` in bits 3-7, plus the MSB of
 `FF_DUR` in bit 7 of `WAKE_UP_DUR`). A real freefall test should be done with
 the sensor secured against damage; use the serial `WAKE_UP_SRC` value to
@@ -79,18 +77,15 @@ dashboard) purely for hardware debugging, e.g. to rule out a wiring or sensor
 fault independently of `INT1`.
 
 `INT2` can optionally be repurposed for one of these sources (bit in
-`CTRL5_INT2_PAD_CTRL`):
+`MD2_CFG`):
 
 | Bit | Signal | Meaning |
 |---|---|---|
-| 0 | `INT2_DRDY` | New acceleration data ready |
-| 1 | `INT2_FTH` | FIFO threshold reached |
-| 2 | `INT2_DIFF5` | FIFO full |
-| 3 | `INT2_OVR` | FIFO overrun |
-| 4 | `INT2_DRDY_T` | New temperature data ready |
-| 5 | `INT2_BOOT` | Boot running |
-| 6 | `INT2_SLEEP_CHG` | Sleep state changed |
-| 7 | `INT2_SLEEP_STATE` | Current sleep state |
+| 3 | `DOUBLE_TAP` | Double-tap event |
+| 4 | `FF` | Free-fall event |
+| 5 | `WU` | Wake-up event |
+| 6 | `SINGLE_TAP` | Single-tap event |
+| 7 | `SLEEP_CHANGE` | Sleep-state change |
 
 ## Power information
 
@@ -98,13 +93,10 @@ There is no current/voltage sensor (e.g. INA219/INA226) on this board, so the
 dashboard cannot show real measured mA/mW. Instead it reports the actual
 configured power-relevant settings, read back from the hardware:
 
-- **LIS2DW12 mode**: decoded from `CTRL1` (ODR in Hz, `High-Performance` vs.
-  `Low-Power` mode 1-4). Currently configured for 400 Hz / High-Performance.
-- **LIS2DW12 typical current**: only quoted for the cases verified on ST's own
-  product page (`~50 nA` power-down, `< 1 uA` in low-power mode). For
-  High-Performance mode this is intentionally left as "not specified here",
-  since actual draw depends heavily on ODR and needs a real current-sensor
-  measurement, not a guessed number.
+- **LIS2DU12 mode**: decoded from `CTRL5` (ODR in Hz; LIS2DU12 uses a 12-bit
+  low-power data path). Currently configured for 400 Hz.
+- **LIS2DU12 typical current**: consult the LIS2DU12 datasheet; exact current
+  depends on ODR and configuration and should be measured externally.
 - **ESP32 CPU frequency**: read via `esp_rom_get_cpu_ticks_per_us()`.
 - **ESP32 Wi-Fi power-save mode**: read via `esp_wifi_get_ps()` after
   `esp_wifi_start()`. Note that in access-point-only mode this setting has
@@ -117,9 +109,9 @@ For real power-consumption numbers, measure the supply current externally
 
 The tap threshold needed for reliable detection is very setup-dependent (rigid
 mounting, board mass, sensor placement). This project currently uses a low
-threshold (`TAP_THS_X/Y = 2`, `TAP_THS_Z = 2`) that was empirically verified
-to work on a rigid, directly-soldered STEVAL-MKI179V1 board — noticeably lower
-than ST's reference example (which uses `12`). If taps aren't detected on a
+threshold (`TAP_THS_X/Y = 2`, `TAP_THS_Z = 2`) as a starting point for the
+STEVAL-MKI222V1. This is noticeably lower than ST's reference example (which
+uses `12`). If taps aren't detected on a
 different mechanical setup, lower the threshold further for diagnosis, then
 raise it again once detection is confirmed to reduce false positives.
 
@@ -136,7 +128,7 @@ pio device monitor       # serial log (115200 baud)
 ```mermaid
 flowchart TD
     A[Power on / app_main] --> B[Init NVS, RMT status LED, I2C bus,\nINT1 GPIO15 + INT2 GPIO14 config + ISRs]
-    B --> C{LIS2DW12 found on I2C?}
+    B --> C{LIS2DU12 found on I2C?}
     C -- No --> C1[Retry probe every 5s]
     C1 --> C
     C -- Yes --> D[Read WHO_AM_I, verify 0x44]
